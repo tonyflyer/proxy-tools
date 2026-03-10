@@ -1,0 +1,111 @@
+# SSH 隧道配置文件
+
+tunnels:
+  # ─────────────────────────────────────────────────────────────
+  # AI API LLM Proxy
+  # ─────────────────────────────────────────────────────────────
+  - name: ai-api
+    type: remote
+    local_port: 11436
+    remote_host: 127.0.0.1
+    remote_port: 11436
+    description: AI API LLM Proxy
+
+  # ─────────────────────────────────────────────────────────────
+  # 实验室内部服务
+  # ─────────────────────────────────────────────────────────────
+  - name: lab-redmine
+    type: remote
+    local_port: 18200
+    remote_host: 172.22.164.35
+    remote_port: 80
+    description: Lab Redmine
+
+  - name: lab-gitlab
+    type: remote
+    local_port: 18201
+    remote_host: 172.22.164.35
+    remote_port: 8080
+    description: Lab GitLab
+
+  # ─────────────────────────────────────────────────────────────
+  # Yizhao DevOps 环境
+  # ─────────────────────────────────────────────────────────────
+  - name: redmine
+    type: remote
+    local_port: 18014
+    remote_host: 127.0.0.1
+    remote_port: 18014
+    description: Redmine
+
+  - name: zentao
+    type: remote
+    local_port: 18015
+    remote_host: 127.0.0.1
+    remote_port: 18015
+    description: Zentao
+
+  - name: gitlab
+    type: remote
+    local_port: 18012
+    remote_host: 127.0.0.1
+    remote_port: 18012
+    description: GitLab
+
+  - name: jenkins
+    type: remote
+    local_port: 18013
+    remote_host: 127.0.0.1
+    remote_port: 18013
+    description: Jenkins
+
+  - name: mailpit
+    type: remote
+    local_port: 18016
+    remote_host: 127.0.0.1
+    remote_port: 18016
+    description: Mailpit
+
+  - name: extra-port
+    type: remote
+    local_port: 18017
+    remote_host: 127.0.0.1
+    remote_port: 18017
+    description: Extra port forwarding
+
+  # ─────────────────────────────────────────────────────────────
+  # 本地代理隧道 (Local Forward -L)
+  # 两个独立的隧道，分别绑定到 localhost 和 LAN
+  # ─────────────────────────────────────────────────────────────
+  - name: local-proxy-localhost
+    type: local
+    bind_address: 127.0.0.1
+    bind_port: 4001
+    remote_host: 127.0.0.1
+    remote_port: 8888
+    description: 本地代理隧道 (localhost)
+
+  - name: local-proxy-lan
+    type: local
+    bind_address: 192.168.2.1
+    bind_port: 4001
+    remote_host: 127.0.0.1
+    remote_port: 8888
+    description: 本地代理隧道 (LAN)
+
+# ─────────────────────────────────────────────────────────────
+# 全局设置 - 10秒快速检测配置
+# ─────────────────────────────────────────────────────────────
+settings:
+  # Python 管理器健康检查间隔（秒）
+  check_interval: 30
+  
+  # 远程 SSH 服务器配置
+  ssh_server: 172.96.254.246
+  ssh_port: 27959
+  ssh_user: zt
+  ssh_key: ~/.ssh/studio_02
+  
+  # autossh 快速检测配置
+  autossh_poll: 10
+  autossh_gatetime: 0
