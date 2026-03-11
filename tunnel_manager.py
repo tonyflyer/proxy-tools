@@ -113,7 +113,7 @@ class TunnelManager:
         ssh_user = self.settings.get('ssh_user', 'zt')
         ssh_key = self._get_ssh_key_path()
         
-        poll = self.settings.get('autossh_poll', 10)
+        poll = self.settings.get('autossh_poll', 60)
 
         if tunnel.tunnel_type == 'remote':
             # 反向隧道 (-R): 远程端口 → 本地端口
@@ -126,6 +126,7 @@ class TunnelManager:
             'autossh', '-M', '0',
             forward_arg,
             '-f', '-N',
+            '-o', 'TCPKeepAlive=yes',
             '-o', f'ServerAliveInterval={poll}',
             '-o', 'ServerAliveCountMax=3',
             '-o', 'ExitOnForwardFailure=yes',
@@ -201,38 +202,30 @@ class TunnelManager:
             return False
 
     def _check_local_proxy(self, bind_address: str, bind_port: int) -> bool:
-        """检查本地代理隧道是否可用 - 通过访问 google.com 验证"""
-        proxy_url = f"http://{bind_address}:{bind_port}"
-        test_url = "http://www.google.com/generate_204"
+        """检查本地代理隧道是否可用 - 通过 TCP 端口检测"""
+        import socket
         
+        # 处理 0.0.0.0 的情况，优先使用 127.0.0.1 检测
+        check_addr = bind_address if bind_address != '0.0.0.0' else '127.0.0.1'
+        
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
         try:
-            # 设置代理
-            proxy_handler = urllib.request.ProxyHandler({
-                'http': proxy_url,
-                'https': proxy_url
-            })
-            opener = urllib.request.build_opener(proxy_handler)
-            
-            # 尝试通过代理访问 google.com
-            request = urllib.request.Request(test_url)
-            request.add_header('User-Agent', 'Mozilla/5.0')
-            
-            response = opener.open(request, timeout=10)
-            
-            # 检查响应状态码
-            if response.status in [200, 204]:
-                self.logger.debug(f"代理 {proxy_url} 验证成功")
+            result = sock.connect_ex((check_addr, bind_port))
+            if result == 0:
+                self.logger.debug(f"代理 {check_addr}:{bind_port} 端口检测成功")
                 return True
             else:
-                self.logger.warning(f"代理 {proxy_url} 返回状态码: {response.status}")
+                self.logger.warning(f"代理 {bind_address}:{bind_port} 端口检测失败")
                 return False
-                
-        except urllib.error.URLError as e:
-            self.logger.warning(f"代理 {proxy_url} 访问失败: {e.reason}")
+        except socket.timeout:
+            self.logger.warning(f"代理 {bind_address}:{bind_port} 连接超时")
             return False
         except Exception as e:
-            self.logger.warning(f"代理 {proxy_url} 验证异常: {e}")
+            self.logger.warning(f"代理 {bind_address}:{bind_port} 检测异常: {e}")
             return False
+        finally:
+            sock.close()
 
     def start_tunnel(self, tunnel: Tunnel) -> bool:
         """启动单个隧道"""

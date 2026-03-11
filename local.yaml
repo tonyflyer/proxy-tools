@@ -1,0 +1,31 @@
+# SSH 隧道配置文件
+
+tunnels:
+  # ─────────────────────────────────────────────────────────────
+  # 本地代理隧道 (Local Forward -L)
+  # 两个独立的隧道，分别绑定到 localhost 和 LAN
+  # ─────────────────────────────────────────────────────────────
+  - name: local-proxy-localhost
+    type: local
+    bind_address: 0.0.0.0
+    bind_port: 4001
+    remote_host: 127.0.0.1
+    remote_port: 8888
+    description: 本地代理隧道 (localhost)
+
+# ─────────────────────────────────────────────────────────────
+# 全局设置
+# ─────────────────────────────────────────────────────────────
+settings:
+  # Python 管理器健康检查间隔（秒）
+  check_interval: 60
+  
+  # 远程 SSH 服务器配置
+  ssh_server: 172.96.254.246
+  ssh_port: 27959
+  ssh_user: zt
+  ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
+  
+  # autossh 检测配置
+  autossh_poll: 60
+  autossh_gatetime: 0
