@@ -24,7 +24,6 @@ import subprocess
 import sys
 import time
 import urllib.request
-import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -47,6 +46,7 @@ class Tunnel:
     # 通用
     description: str = ""
     pid: Optional[int] = None
+    start_time: Optional[float] = None  # 隧道启动时间戳
 
 
 class TunnelManager:
@@ -122,7 +122,7 @@ class TunnelManager:
             # 本地转发 (-L): 本地端口 → 远程端口
             forward_arg = f'-L {tunnel.bind_address}:{tunnel.bind_port}:{tunnel.remote_host}:{tunnel.remote_port}'
 
-        return [
+        cmd = [
             'autossh', '-M', '0',
             forward_arg,
             '-f', '-N',
@@ -135,6 +135,14 @@ class TunnelManager:
             '-p', str(ssh_port),
             f'{ssh_user}@{ssh_server}'
         ]
+
+        # 添加绑定地址参数 (-b)，用于指定从哪个 IP 出站
+        bind_address = self.settings.get('bind_address', '')
+        if bind_address:
+            cmd.insert(1, '-b')
+            cmd.insert(2, bind_address)
+
+        return cmd
 
     def _get_process_identifier(self, tunnel: Tunnel) -> str:
         """获取用于进程查找的唯一标识符
@@ -245,10 +253,38 @@ class TunnelManager:
         try:
             result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
-                time.sleep(2)
-                tunnel.pid = self._find_autossh_pid(tunnel)
-                self.logger.info(f"隧道 {tunnel.name} 启动成功 (PID: {tunnel.pid})")
-                return True
+                # 等待并检查端口是否就绪（最多重试10次，每次1秒）
+                max_retries = 10
+                retry_interval = 1
+                for attempt in range(max_retries):
+                    time.sleep(retry_interval)
+                    tunnel.pid = self._find_autossh_pid(tunnel)
+                    if tunnel.pid:
+                        # 检查端口是否已监听
+                        if self._check_tunnel_port(tunnel):
+                            tunnel.start_time = time.time()
+                            self.logger.info(
+                                f"隧道 {tunnel.name} 启动成功 (PID: {tunnel.pid}, "
+                                f"等待 {attempt + 1} 秒后端口就绪)"
+                            )
+                            return True
+                        else:
+                            self.logger.debug(
+                                f"隧道 {tunnel.name} 进程已启动，"
+                                f"等待端口就绪 (尝试 {attempt + 1}/{max_retries})..."
+                            )
+                    else:
+                        self.logger.debug(
+                            f"隧道 {tunnel.name} 进程尚未就绪 "
+                            f"(尝试 {attempt + 1}/{max_retries})..."
+                        )
+                
+                # 达到最大重试次数，启动失败
+                self.logger.error(
+                    f"隧道 {tunnel.name} 启动失败: "
+                    f"等待 {max_retries} 秒后端口仍未就绪"
+                )
+                return False
             else:
                 self.logger.error(f"隧道 {tunnel.name} 启动失败: {result.stderr}")
                 return False
@@ -304,14 +340,35 @@ class TunnelManager:
             self.stop_tunnel(tunnel)
 
     def check_health(self) -> Dict[str, bool]:
-        """检查所有隧道健康状态"""
+        """检查所有隧道健康状态
+        
+        对于刚启动的隧道（30秒内），给予宽限期，避免误判。
+        只有当进程和端口都异常时才报告不健康。
+        """
         status = {}
+        grace_period = 30
+        
         for tunnel in self.tunnels.values():
             pid = self._find_autossh_pid(tunnel)
             process_ok = pid is not None
             port_ok = self._check_tunnel_port(tunnel)
             
+            # 基础健康状态
             is_healthy = process_ok and port_ok
+            
+            # 检查是否在宽限期内
+            if tunnel.start_time is not None:
+                elapsed = time.time() - tunnel.start_time
+                in_grace_period = elapsed < grace_period
+                
+                # 宽限期内：进程存在但端口未就绪时，暂不判定为异常
+                if not is_healthy and in_grace_period and process_ok and not port_ok:
+                    self.logger.debug(
+                        f"隧道 {tunnel.name} 在宽限期内 "
+                        f"(已启动 {elapsed:.1f}s)，暂不判定为异常"
+                    )
+                    is_healthy = True
+            
             status[tunnel.name] = is_healthy
             
             if not is_healthy:
@@ -331,8 +388,15 @@ class TunnelManager:
         self.running = True
         
         def signal_handler(signum, frame):
-            self.logger.info("收到停止信号，正在退出...")
+            if not self.running:
+                # 已经在退出过程中，直接返回避免重复处理
+                return
+            self.logger.info("收到停止信号，正在清理进程...")
             self.running = False
+            # 立即清理所有隧道进程
+            self.stop_all()
+            self.logger.info("隧道管理器已停止")
+            sys.exit(0)
         
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
@@ -343,8 +407,12 @@ class TunnelManager:
         self.logger.info(f"健康检查间隔: {check_interval} 秒")
         self.logger.info("按 Ctrl+C 退出")
 
+        # 主循环：使用小间隔循环，以便快速响应退出信号
         while self.running:
-            time.sleep(check_interval)
+            for _ in range(check_interval):
+                if not self.running:
+                    break
+                time.sleep(1)
             
             if not self.running:
                 break

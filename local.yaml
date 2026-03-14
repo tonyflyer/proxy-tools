@@ -25,7 +25,11 @@ settings:
   ssh_port: 27959
   ssh_user: zt
   ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
-  
+
+  # 绑定地址 - 用于指定 SSH 客户端从哪个 IP 出站（留空则使用默认路由）
+  # 例如: 10.8.0.5 (VPN 分配的 IP)，这样 SSH 流量会走 VPN 通道
+  bind_address: "192.168.100.17"
+
   # autossh 检测配置
   autossh_poll: 60
   autossh_gatetime: 0
