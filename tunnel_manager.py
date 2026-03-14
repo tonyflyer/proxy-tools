@@ -155,6 +155,50 @@ class TunnelManager:
             # 本地转发使用完整的绑定地址和端口组合
             return f"{tunnel.bind_address}:{tunnel.bind_port}"
 
+    def _cleanup_tunnel_process(self, tunnel: Tunnel) -> None:
+        """清理与隧道相关的残余autossh和ssh进程"""
+        identifier = self._get_process_identifier(tunnel)
+        
+        # 清理 autossh 进程
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', f'autossh.*{identifier}'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for pid in result.stdout.strip().split('\n'):
+                    if pid:
+                        try:
+                            subprocess.run(['kill', '-9', pid], check=True)
+                            self.logger.info(
+                                f"清理残余进程: autossh (PID: {pid}) for tunnel {tunnel.name}"
+                            )
+                        except subprocess.CalledProcessError:
+                            pass
+        except Exception as e:
+            self.logger.error(f"清理 autossh 进程失败: {e}")
+        
+        # 清理 ssh 进程
+        try:
+            result = subprocess.run(
+                ['pgrep', '-f', f'ssh.*{identifier}'],
+                capture_output=True,
+                text=True
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for pid in result.stdout.strip().split('\n'):
+                    if pid:
+                        try:
+                            subprocess.run(['kill', '-9', pid], check=True)
+                            self.logger.info(
+                                f"清理残余进程: ssh (PID: {pid}) for tunnel {tunnel.name}"
+                            )
+                        except subprocess.CalledProcessError:
+                            pass
+        except Exception as e:
+            self.logger.error(f"清理 ssh 进程失败: {e}")
+
     def _find_autossh_pid(self, tunnel: Tunnel) -> Optional[int]:
         """查找隧道对应的 autossh 进程 PID"""
         identifier = self._get_process_identifier(tunnel)
@@ -237,6 +281,12 @@ class TunnelManager:
 
     def start_tunnel(self, tunnel: Tunnel) -> bool:
         """启动单个隧道"""
+        # 先清理残余进程，避免与新启动的隧道冲突
+        self._cleanup_tunnel_process(tunnel)
+        
+        # 等待一小段时间确保进程完全清理
+        time.sleep(1)
+        
         pid = self._find_autossh_pid(tunnel)
         if pid:
             self.logger.info(f"隧道 {tunnel.name} 已在运行 (PID: {pid})")
