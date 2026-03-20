@@ -1,20 +1,38 @@
-# SSH 隧道配置文件
+# =============================================================================
+# SSH 隧道统一配置 — 所有服务器和隧道
+# =============================================================================
+
+servers:
+  # ─── 一桩科技云服务器 (跳板机) ─────────────────────────────────
+  yizhao:
+    ssh_server: 172.96.254.246
+    ssh_port: 27959
+    ssh_user: zt
+    ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
+    bind_address: "192.168.100.17"
+    autossh_poll: 10
+
+  # ─── DevOps 环境 (Mac Studio 02) ──────────────────────────────
+  devops:
+    ssh_server: 172.22.164.60
+    ssh_port: 22
+    ssh_user: zhangtony
+    ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
+    autossh_poll: 30
 
 tunnels:
-  # ─────────────────────────────────────────────────────────────
-  # AI API LLM Proxy
-  # ─────────────────────────────────────────────────────────────
+  # ─── yizhao: AI API ────────────────────────────────────────────
   - name: ai-api
+    server: yizhao
     type: remote
     local_port: 11436
     remote_host: 127.0.0.1
     remote_port: 11436
     description: AI API LLM Proxy
 
-  # ─────────────────────────────────────────────────────────────
-  # 实验室内部服务
-  # ─────────────────────────────────────────────────────────────
+  # ─── yizhao: 实验室内部服务 ─────────────────────────────────────
   - name: lab-redmine
+    server: yizhao
     type: remote
     local_port: 18200
     remote_host: 172.22.164.35
@@ -22,16 +40,16 @@ tunnels:
     description: Lab Redmine
 
   - name: lab-gitlab
+    server: yizhao
     type: remote
     local_port: 18201
     remote_host: 172.22.164.35
     remote_port: 8080
     description: Lab GitLab
 
-  # ─────────────────────────────────────────────────────────────
-  # Yizhao DevOps 环境
-  # ─────────────────────────────────────────────────────────────
+  # ─── yizhao: DevOps 环境转发 ────────────────────────────────────
   - name: redmine
+    server: yizhao
     type: remote
     local_port: 18014
     remote_host: 127.0.0.1
@@ -39,13 +57,15 @@ tunnels:
     description: Redmine
 
   - name: zentao
+    server: yizhao
     type: remote
     local_port: 18015
     remote_host: 127.0.0.1
     remote_port: 18015
-    description: Zentao
+    description: ZenTao
 
   - name: gitlab
+    server: yizhao
     type: remote
     local_port: 18012
     remote_host: 127.0.0.1
@@ -53,6 +73,7 @@ tunnels:
     description: GitLab
 
   - name: jenkins
+    server: yizhao
     type: remote
     local_port: 18013
     remote_host: 127.0.0.1
@@ -60,6 +81,7 @@ tunnels:
     description: Jenkins
 
   - name: mailpit
+    server: yizhao
     type: remote
     local_port: 18016
     remote_host: 127.0.0.1
@@ -67,45 +89,57 @@ tunnels:
     description: Mailpit
 
   - name: extra-port
+    server: yizhao
     type: remote
     local_port: 18017
     remote_host: 127.0.0.1
     remote_port: 18017
-    description: Extra port forwarding
+    description: Extra port
 
-  # ─────────────────────────────────────────────────────────────
-  # 本地代理隧道 (Local Forward -L)
-  # 两个独立的隧道，分别绑定到 localhost 和 LAN
-  # ─────────────────────────────────────────────────────────────
+  # ─── yizhao: 本地代理 (Local Forward) ──────────────────────────
   - name: local-proxy-localhost
+    server: yizhao
     type: local
     bind_address: 127.0.0.1
     bind_port: 4001
     remote_host: 127.0.0.1
     remote_port: 8888
-    description: 本地代理隧道 (localhost)
+    description: 本地代理 (localhost)
 
   - name: local-proxy-lan
+    server: yizhao
     type: local
     bind_address: 192.168.2.1
     bind_port: 4001
     remote_host: 127.0.0.1
     remote_port: 8888
-    description: 本地代理隧道 (LAN)
+    description: 本地代理 (LAN)
 
-# ─────────────────────────────────────────────────────────────
-# 全局设置 - 10秒快速检测配置
-# ─────────────────────────────────────────────────────────────
+  # ─── devops: CodeForge 反向隧道 ─────────────────────────────────
+  - name: codeforge-api
+    server: devops
+    type: remote
+    local_port: 18440
+    remote_host: 127.0.0.1
+    remote_port: 18440
+    description: CodeForge API (webhook receiver)
+
+  - name: codeforge-ws
+    server: devops
+    type: remote
+    local_port: 18441
+    remote_host: 127.0.0.1
+    remote_port: 18441
+    description: CodeForge WebSocket
+
+  - name: codeforge-dashboard
+    server: devops
+    type: remote
+    local_port: 18443
+    remote_host: 127.0.0.1
+    remote_port: 18443
+    description: CodeForge Dashboard
+
 settings:
-  # Python 管理器健康检查间隔（秒）
   check_interval: 30
-  
-  # 远程 SSH 服务器配置
-  ssh_server: 172.96.254.246
-  ssh_port: 27959
-  ssh_user: zt
-  ssh_key: ~/.ssh/studio_02
-  
-  # autossh 快速检测配置
-  autossh_poll: 10
   autossh_gatetime: 0

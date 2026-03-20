@@ -1,19 +1,53 @@
 #!/usr/bin/env python3
 """
-SSH Tunnel Manager - 自动管理多个 SSH 反向隧道和本地转发
+SSH Tunnel Manager - 管理多服务器 SSH 反向隧道和本地转发
 
-功能：
-1. 统一定义隧道配置（支持 -R 反向隧道和 -L 本地转发）
-2. 定期自动检查隧道状态
-3. 自动重启断开的隧道
-4. 作为守护进程运行
+支持在单个配置文件中定义多个 SSH 服务器及其隧道，也支持加载多个配置文件。
 
 使用方法：
-    python3 tunnel_manager.py --daemon      # 后台守护进程
-    python3 tunnel_manager.py --foreground  # 前台运行（调试）
-    python3 tunnel_manager.py --status      # 查看状态
-    python3 tunnel_manager.py --restart     # 重启所有隧道
-    python3 tunnel_manager.py --stop        # 停止所有隧道
+    python3 tunnel_manager.py --status                  # 所有隧道状态
+    python3 tunnel_manager.py --status --server devops   # 只看 devops 服务器
+    python3 tunnel_manager.py --restart                  # 重启所有
+    python3 tunnel_manager.py --restart --server devops   # 只重启 devops
+    python3 tunnel_manager.py --foreground               # 前台守护所有
+    python3 tunnel_manager.py --config a.yaml b.yaml     # 加载多个配置
+    python3 tunnel_manager.py --stop                     # 停止所有
+
+配置格式 (新版 — 多服务器):
+    servers:
+      yizhao:
+        ssh_server: 172.96.254.246
+        ssh_port: 27959
+        ssh_user: zt
+        ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
+        bind_address: "192.168.100.17"
+        autossh_poll: 10
+      devops:
+        ssh_server: 172.22.164.60
+        ssh_port: 22
+        ssh_user: zhangtony
+        ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
+
+    tunnels:
+      - name: ai-api
+        server: yizhao
+        type: remote
+        local_port: 11436
+        remote_host: 127.0.0.1
+        remote_port: 11436
+
+    settings:
+      check_interval: 30
+      autossh_gatetime: 0
+
+配置格式 (旧版 — 单服务器, 完全兼容):
+    tunnels:
+      - name: ai-api
+        type: remote
+        ...
+    settings:
+      ssh_server: 172.96.254.246
+      ...
 """
 
 import argparse
@@ -23,8 +57,7 @@ import signal
 import subprocess
 import sys
 import time
-import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -32,261 +65,306 @@ import yaml
 
 
 @dataclass
-class Tunnel:
-    """隧道配置"""
+class ServerConfig:
     name: str
-    tunnel_type: str  # 'remote' 或 'local'
-    # 远程隧道 (-R) 使用
+    ssh_server: str
+    ssh_port: int = 22
+    ssh_user: str = ""
+    ssh_key: str = "~/.ssh/id_ed25519"
+    bind_address: str = ""
+    autossh_poll: int = 30
+
+    def resolved_key(self) -> str:
+        return os.path.expanduser(self.ssh_key)
+
+
+@dataclass
+class Tunnel:
+    name: str
+    tunnel_type: str  # 'remote' or 'local'
+    server_name: str = ""
     local_port: int = 0
     remote_host: str = ""
     remote_port: int = 0
-    # 本地转发 (-L) 使用
     bind_address: str = ""
     bind_port: int = 0
-    # 通用
     description: str = ""
     pid: Optional[int] = None
-    start_time: Optional[float] = None  # 隧道启动时间戳
+    start_time: Optional[float] = None
+    fail_count: int = 0
 
 
 class TunnelManager:
-    """SSH 隧道管理器"""
-
-    def __init__(self, config_path: str):
-        self.config_path = config_path
+    def __init__(self, config_paths: List[str], server_filter: Optional[str] = None):
+        self.config_paths = config_paths
+        self.server_filter = server_filter
+        self.servers: Dict[str, ServerConfig] = {}
         self.tunnels: Dict[str, Tunnel] = {}
-        self.settings: Dict = {}
+        self.global_settings: Dict = {}
         self.running = False
         self.log_file = Path(__file__).parent / "tunnel_manager.log"
-        
+
         self._setup_logging()
-        self._load_config()
+        self._load_all_configs()
 
     def _setup_logging(self):
-        """配置日志"""
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(self.log_file),
-                logging.StreamHandler(sys.stdout)
-            ]
+            format="%(asctime)s [%(levelname)s] %(message)s",
+            handlers=[logging.FileHandler(self.log_file), logging.StreamHandler(sys.stdout)],
         )
         self.logger = logging.getLogger(__name__)
 
-    def _load_config(self):
-        """加载配置文件"""
-        config_file = Path(self.config_path)
+    # =========================================================================
+    # Config Loading — supports both legacy (single server) and new (multi)
+    # =========================================================================
+
+    def _load_all_configs(self):
+        for path in self.config_paths:
+            self._load_config(path)
+
+        if self.server_filter:
+            filtered = {k: v for k, v in self.tunnels.items() if v.server_name == self.server_filter}
+            skipped = len(self.tunnels) - len(filtered)
+            self.tunnels = filtered
+            if skipped:
+                self.logger.info(f"过滤服务器 '{self.server_filter}': 保留 {len(filtered)} 个隧道, 跳过 {skipped} 个")
+
+        self.logger.info(f"已加载 {len(self.servers)} 个服务器, {len(self.tunnels)} 个隧道")
+
+    def _load_config(self, config_path: str):
+        config_file = Path(config_path)
         if not config_file.exists():
-            self.logger.error(f"配置文件不存在: {self.config_path}")
+            self.logger.error(f"配置文件不存在: {config_path}")
             sys.exit(1)
 
-        with open(config_file, 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
 
-        self.settings = config.get('settings', {})
-        
-        for t in config.get('tunnels', []):
+        settings = config.get("settings", {})
+        for k, v in settings.items():
+            if k not in self.global_settings:
+                self.global_settings[k] = v
+
+        servers_cfg = config.get("servers", {})
+        if servers_cfg:
+            for srv_name, srv_data in servers_cfg.items():
+                self.servers[srv_name] = ServerConfig(
+                    name=srv_name,
+                    ssh_server=srv_data.get("ssh_server", ""),
+                    ssh_port=int(srv_data.get("ssh_port", 22)),
+                    ssh_user=srv_data.get("ssh_user", ""),
+                    ssh_key=srv_data.get("ssh_key", "~/.ssh/id_ed25519"),
+                    bind_address=srv_data.get("bind_address", ""),
+                    autossh_poll=int(srv_data.get("autossh_poll", settings.get("autossh_poll", 30))),
+                )
+        else:
+            default_name = self._infer_server_name(config_path, settings)
+            if default_name not in self.servers:
+                self.servers[default_name] = ServerConfig(
+                    name=default_name,
+                    ssh_server=settings.get("ssh_server", ""),
+                    ssh_port=int(settings.get("ssh_port", 22)),
+                    ssh_user=settings.get("ssh_user", ""),
+                    ssh_key=settings.get("ssh_key", "~/.ssh/id_ed25519"),
+                    bind_address=settings.get("bind_address", ""),
+                    autossh_poll=int(settings.get("autossh_poll", 30)),
+                )
+
+        for t in config.get("tunnels", []):
+            tunnel_server = t.get("server", "")
+            if not tunnel_server:
+                if servers_cfg:
+                    tunnel_server = list(servers_cfg.keys())[0]
+                else:
+                    tunnel_server = self._infer_server_name(config_path, settings)
+
             tunnel = Tunnel(
-                name=t['name'],
-                tunnel_type=t.get('type', 'remote'),
-                local_port=t.get('local_port', 0),
-                remote_host=t.get('remote_host', ''),
-                remote_port=t.get('remote_port', 0),
-                bind_address=t.get('bind_address', ''),
-                bind_port=t.get('bind_port', 0),
-                description=t.get('description', '')
+                name=t["name"],
+                tunnel_type=t.get("type", "remote"),
+                server_name=tunnel_server,
+                local_port=t.get("local_port", 0),
+                remote_host=t.get("remote_host", ""),
+                remote_port=t.get("remote_port", 0),
+                bind_address=t.get("bind_address", ""),
+                bind_port=t.get("bind_port", 0),
+                description=t.get("description", ""),
             )
             self.tunnels[tunnel.name] = tunnel
 
-        self.logger.info(f"已加载 {len(self.tunnels)} 个隧道配置")
+    def _infer_server_name(self, config_path: str, settings: dict) -> str:
+        stem = Path(config_path).stem.replace(".yaml", "").replace(".yml", "")
+        if stem == "tunnels":
+            host = settings.get("ssh_server", "default")
+            return host.replace(".", "-")
+        return stem
 
-    def _get_ssh_key_path(self) -> str:
-        """获取 SSH 密钥路径"""
-        key = self.settings.get('ssh_key', '~/.ssh/studio_02')
-        return os.path.expanduser(key)
+    def _get_server(self, tunnel: Tunnel) -> ServerConfig:
+        srv = self.servers.get(tunnel.server_name)
+        if not srv:
+            self.logger.error(f"隧道 {tunnel.name} 引用了不存在的服务器 '{tunnel.server_name}'")
+            self.logger.error(f"  可用服务器: {list(self.servers.keys())}")
+            sys.exit(1)
+        return srv
+
+    # =========================================================================
+    # autossh command building
+    # =========================================================================
 
     def _build_autossh_cmd(self, tunnel: Tunnel) -> List[str]:
-        """构建 autossh 命令"""
-        ssh_server = self.settings.get('ssh_server', '172.96.254.246')
-        ssh_port = self.settings.get('ssh_port', 27959)
-        ssh_user = self.settings.get('ssh_user', 'zt')
-        ssh_key = self._get_ssh_key_path()
-        
-        poll = self.settings.get('autossh_poll', 60)
+        srv = self._get_server(tunnel)
+        poll = srv.autossh_poll
 
-        if tunnel.tunnel_type == 'remote':
-            # 反向隧道 (-R): 远程端口 → 本地端口
-            forward_arg = f'-R 127.0.0.1:{tunnel.local_port}:{tunnel.remote_host}:{tunnel.remote_port}'
+        if tunnel.tunnel_type == "remote":
+            forward_arg = f"-R 127.0.0.1:{tunnel.local_port}:{tunnel.remote_host}:{tunnel.remote_port}"
         else:
-            # 本地转发 (-L): 本地端口 → 远程端口
-            forward_arg = f'-L {tunnel.bind_address}:{tunnel.bind_port}:{tunnel.remote_host}:{tunnel.remote_port}'
+            forward_arg = f"-L {tunnel.bind_address}:{tunnel.bind_port}:{tunnel.remote_host}:{tunnel.remote_port}"
 
         cmd = [
-            'autossh', '-M', '0',
+            "autossh",
+            "-M",
+            "0",
             forward_arg,
-            '-f', '-N',
-            '-o', 'TCPKeepAlive=yes',
-            '-o', f'ServerAliveInterval={poll}',
-            '-o', 'ServerAliveCountMax=3',
-            '-o', 'ExitOnForwardFailure=yes',
-            '-o', 'StrictHostKeyChecking=no',
-            '-i', ssh_key,
-            '-p', str(ssh_port),
-            f'{ssh_user}@{ssh_server}'
+            "-f",
+            "-N",
+            "-o",
+            "TCPKeepAlive=yes",
+            "-o",
+            f"ServerAliveInterval={poll}",
+            "-o",
+            "ServerAliveCountMax=3",
+            "-o",
+            "ExitOnForwardFailure=yes",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-i",
+            srv.resolved_key(),
+            "-p",
+            str(srv.ssh_port),
+            f"{srv.ssh_user}@{srv.ssh_server}",
         ]
 
-        # 添加绑定地址参数 (-b)，用于指定从哪个 IP 出站
-        bind_address = self.settings.get('bind_address', '')
-        if bind_address:
-            cmd.insert(1, '-b')
-            cmd.insert(2, bind_address)
+        if srv.bind_address:
+            cmd.insert(1, "-b")
+            cmd.insert(2, srv.bind_address)
 
         return cmd
 
+    # =========================================================================
+    # Process management
+    # =========================================================================
+
     def _get_process_identifier(self, tunnel: Tunnel) -> str:
-        """获取用于进程查找的唯一标识符
-        
-        对于本地转发隧道，使用 bind_address:bind_port 组合来唯一标识
-        """
-        if tunnel.tunnel_type == 'remote':
+        if tunnel.tunnel_type == "remote":
             return str(tunnel.local_port)
         else:
-            # 本地转发使用完整的绑定地址和端口组合
             return f"{tunnel.bind_address}:{tunnel.bind_port}"
 
     def _cleanup_tunnel_process(self, tunnel: Tunnel) -> None:
-        """清理与隧道相关的残余autossh和ssh进程"""
         identifier = self._get_process_identifier(tunnel)
-        
-        # 清理 autossh 进程
-        try:
-            result = subprocess.run(
-                ['pgrep', '-f', f'autossh.*{identifier}'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                for pid in result.stdout.strip().split('\n'):
-                    if pid:
-                        try:
-                            subprocess.run(['kill', '-9', pid], check=True)
-                            self.logger.info(
-                                f"清理残余进程: autossh (PID: {pid}) for tunnel {tunnel.name}"
-                            )
-                        except subprocess.CalledProcessError:
-                            pass
-        except Exception as e:
-            self.logger.error(f"清理 autossh 进程失败: {e}")
-        
-        # 清理 ssh 进程
-        try:
-            result = subprocess.run(
-                ['pgrep', '-f', f'ssh.*{identifier}'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                for pid in result.stdout.strip().split('\n'):
-                    if pid:
-                        try:
-                            subprocess.run(['kill', '-9', pid], check=True)
-                            self.logger.info(
-                                f"清理残余进程: ssh (PID: {pid}) for tunnel {tunnel.name}"
-                            )
-                        except subprocess.CalledProcessError:
-                            pass
-        except Exception as e:
-            self.logger.error(f"清理 ssh 进程失败: {e}")
+        srv = self._get_server(tunnel)
+        pattern = f"{identifier}.*{srv.ssh_server}"
+
+        for proc_type in ["autossh", "ssh"]:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", f"{proc_type}.*{pattern}"],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    for pid in result.stdout.strip().split("\n"):
+                        if pid:
+                            try:
+                                # 先 SIGTERM，再 SIGKILL
+                                subprocess.run(["kill", pid], check=False)
+                                time.sleep(1)
+                                subprocess.run(["kill", "-9", pid], check=False)
+                                self.logger.info(f"清理残余进程: {proc_type} (PID: {pid}) for {tunnel.name}")
+                            except subprocess.CalledProcessError:
+                                pass
+            except Exception as e:
+                self.logger.error(f"清理 {proc_type} 进程失败: {e}")
 
     def _find_autossh_pid(self, tunnel: Tunnel) -> Optional[int]:
-        """查找隧道对应的 autossh 进程 PID"""
         identifier = self._get_process_identifier(tunnel)
+        srv = self._get_server(tunnel)
+        pattern = f"autossh.*{identifier}.*{srv.ssh_server}"
         try:
-            # 使用更精确的模式匹配
-            result = subprocess.run(
-                ['pgrep', '-f', f'autossh.*{identifier}'],
-                capture_output=True,
-                text=True
-            )
+            result = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
             if result.returncode == 0:
-                pids = result.stdout.strip().split('\n')
+                pids = result.stdout.strip().split("\n")
                 if pids and pids[0]:
                     return int(pids[0])
         except Exception as e:
             self.logger.error(f"查找进程失败: {e}")
         return None
 
-    def _check_tunnel_port(self, tunnel: Tunnel) -> bool:
-        """检查隧道端口状态"""
-        if tunnel.tunnel_type == 'remote':
-            # 远程隧道：检查远程服务器上的端口
-            return self._check_remote_port(tunnel.local_port)
+    # =========================================================================
+    # Health checks
+    # =========================================================================
+
+    def _check_tunnel_port(self, tunnel: Tunnel) -> Optional[bool]:
+        """返回 True=正常, False=异常, None=未知(超时等)"""
+        if tunnel.tunnel_type == "remote":
+            return self._check_remote_port(tunnel)
         else:
-            # 本地转发：通过代理访问 google.com 验证隧道
             return self._check_local_proxy(tunnel.bind_address, tunnel.bind_port)
 
-    def _check_remote_port(self, port: int) -> bool:
-        """检查远程服务器上的端口是否监听"""
-        ssh_server = self.settings.get('ssh_server', '172.96.254.246')
-        ssh_port = self.settings.get('ssh_port', 27959)
-        ssh_user = self.settings.get('ssh_user', 'zt')
-        ssh_key = self._get_ssh_key_path()
+    def _check_remote_port(self, tunnel: Tunnel) -> Optional[bool]:
+        """返回 True=端口在监听, False=端口未监听, None=检查超时(不确定)"""
+        srv = self._get_server(tunnel)
+        port = tunnel.local_port
+        check_cmd = f"ss -tlnp 2>/dev/null | grep -q :{port} || lsof -i :{port} 2>/dev/null | grep -q LISTEN"
 
         try:
             result = subprocess.run(
                 [
-                    'ssh', '-i', ssh_key, '-p', str(ssh_port),
-                    '-o', 'ConnectTimeout=5',
-                    '-o', 'StrictHostKeyChecking=no',
-                    f'{ssh_user}@{ssh_server}',
-                    f'ss -tlnp | grep -q :{port}'
+                    "ssh",
+                    "-i",
+                    srv.resolved_key(),
+                    "-p",
+                    str(srv.ssh_port),
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "StrictHostKeyChecking=no",
+                    f"{srv.ssh_user}@{srv.ssh_server}",
+                    check_cmd,
                 ],
                 capture_output=True,
-                timeout=10
+                timeout=10,
             )
             return result.returncode == 0
         except subprocess.TimeoutExpired:
-            self.logger.warning(f"检查远程端口 {port} 超时")
-            return False
+            self.logger.warning(f"检查远程端口 {port}@{srv.name} 超时 (视为未知)")
+            return None
         except Exception as e:
             self.logger.error(f"检查远程端口失败: {e}")
-            return False
+            return None
 
     def _check_local_proxy(self, bind_address: str, bind_port: int) -> bool:
-        """检查本地代理隧道是否可用 - 通过 TCP 端口检测"""
         import socket
-        
-        # 处理 0.0.0.0 的情况，优先使用 127.0.0.1 检测
-        check_addr = bind_address if bind_address != '0.0.0.0' else '127.0.0.1'
-        
+
+        check_addr = bind_address if bind_address != "0.0.0.0" else "127.0.0.1"
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)
         try:
             result = sock.connect_ex((check_addr, bind_port))
-            if result == 0:
-                self.logger.debug(f"代理 {check_addr}:{bind_port} 端口检测成功")
-                return True
-            else:
-                self.logger.warning(f"代理 {bind_address}:{bind_port} 端口检测失败")
-                return False
-        except socket.timeout:
-            self.logger.warning(f"代理 {bind_address}:{bind_port} 连接超时")
-            return False
-        except Exception as e:
-            self.logger.warning(f"代理 {bind_address}:{bind_port} 检测异常: {e}")
+            return result == 0
+        except Exception:
             return False
         finally:
             sock.close()
 
+    # =========================================================================
+    # Start / Stop
+    # =========================================================================
+
     def start_tunnel(self, tunnel: Tunnel) -> bool:
-        """启动单个隧道"""
-        # 先清理残余进程，避免与新启动的隧道冲突
         self._cleanup_tunnel_process(tunnel)
-        
-        # 等待一小段时间确保进程完全清理
         time.sleep(1)
-        
+
         pid = self._find_autossh_pid(tunnel)
         if pid:
             self.logger.info(f"隧道 {tunnel.name} 已在运行 (PID: {pid})")
@@ -294,46 +372,24 @@ class TunnelManager:
             return True
 
         cmd = self._build_autossh_cmd(tunnel)
-        self.logger.info(f"启动隧道 {tunnel.name}...")
+        self.logger.info(f"启动隧道 {tunnel.name} → {self._get_server(tunnel).ssh_server}...")
 
         env = os.environ.copy()
-        env['AUTOSSH_GATETIME'] = str(self.settings.get('autossh_gatetime', 0))
-        env['AUTOSSH_POLL'] = str(self.settings.get('autossh_poll', 10))
+        env["AUTOSSH_GATETIME"] = str(self.global_settings.get("autossh_gatetime", 0))
+        env["AUTOSSH_POLL"] = str(self._get_server(tunnel).autossh_poll)
 
         try:
             result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
             if result.returncode == 0:
-                # 等待并检查端口是否就绪（最多重试10次，每次1秒）
-                max_retries = 10
-                retry_interval = 1
-                for attempt in range(max_retries):
-                    time.sleep(retry_interval)
+                for attempt in range(12):
+                    time.sleep(1)
                     tunnel.pid = self._find_autossh_pid(tunnel)
-                    if tunnel.pid:
-                        # 检查端口是否已监听
-                        if self._check_tunnel_port(tunnel):
-                            tunnel.start_time = time.time()
-                            self.logger.info(
-                                f"隧道 {tunnel.name} 启动成功 (PID: {tunnel.pid}, "
-                                f"等待 {attempt + 1} 秒后端口就绪)"
-                            )
-                            return True
-                        else:
-                            self.logger.debug(
-                                f"隧道 {tunnel.name} 进程已启动，"
-                                f"等待端口就绪 (尝试 {attempt + 1}/{max_retries})..."
-                            )
-                    else:
-                        self.logger.debug(
-                            f"隧道 {tunnel.name} 进程尚未就绪 "
-                            f"(尝试 {attempt + 1}/{max_retries})..."
-                        )
-                
-                # 达到最大重试次数，启动失败
-                self.logger.error(
-                    f"隧道 {tunnel.name} 启动失败: "
-                    f"等待 {max_retries} 秒后端口仍未就绪"
-                )
+                    if tunnel.pid and self._check_tunnel_port(tunnel):
+                        tunnel.start_time = time.time()
+                        self.logger.info(f"隧道 {tunnel.name} 启动成功 (PID: {tunnel.pid}, {attempt + 1}s)")
+                        return True
+
+                self.logger.error(f"隧道 {tunnel.name} 启动失败: 端口未就绪")
                 return False
             else:
                 self.logger.error(f"隧道 {tunnel.name} 启动失败: {result.stderr}")
@@ -343,29 +399,25 @@ class TunnelManager:
             return False
 
     def stop_tunnel(self, tunnel: Tunnel) -> bool:
-        """停止单个隧道"""
         pid = self._find_autossh_pid(tunnel)
         if not pid:
             self.logger.info(f"隧道 {tunnel.name} 未运行")
             return True
 
         try:
-            subprocess.run(['kill', '-9', str(pid)], check=True)
-            time.sleep(1)
-            
-            # 也杀掉可能残留的 ssh 进程
-            identifier = self._get_process_identifier(tunnel)
-            result = subprocess.run(
-                ['pgrep', '-f', f'ssh.*{identifier}'],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0:
-                for ssh_pid in result.stdout.strip().split('\n'):
-                    if ssh_pid:
-                        subprocess.run(['kill', '-9', ssh_pid])
-            
+            # 先 SIGTERM 优雅退出，让 SSH 正常关闭远程端口
+            subprocess.run(["kill", str(pid)], check=False)
+            for _ in range(5):
+                time.sleep(1)
+                if not self._find_autossh_pid(tunnel):
+                    break
+            else:
+                # 5 秒后仍未退出，强制 SIGKILL
+                subprocess.run(["kill", "-9", str(pid)], check=False)
+                time.sleep(1)
+            self._cleanup_tunnel_process(tunnel)
             tunnel.pid = None
+            tunnel.fail_count = 0
             self.logger.info(f"隧道 {tunnel.name} 已停止")
             return True
         except Exception as e:
@@ -373,7 +425,6 @@ class TunnelManager:
             return False
 
     def start_all(self):
-        """启动所有隧道"""
         self.logger.info("=" * 60)
         self.logger.info("启动所有隧道...")
         self.logger.info("=" * 60)
@@ -384,150 +435,205 @@ class TunnelManager:
         self.logger.info(f"启动完成: {success}/{len(self.tunnels)}")
 
     def stop_all(self):
-        """停止所有隧道"""
         self.logger.info("停止所有隧道...")
         for tunnel in self.tunnels.values():
             self.stop_tunnel(tunnel)
 
+    # =========================================================================
+    # Health check loop
+    # =========================================================================
+
     def check_health(self) -> Dict[str, bool]:
-        """检查所有隧道健康状态
-        
-        对于刚启动的隧道（30秒内），给予宽限期，避免误判。
-        只有当进程和端口都异常时才报告不健康。
-        """
         status = {}
         grace_period = 30
-        
+        max_fail_count = 3  # 连续失败多少次才触发重启
+
         for tunnel in self.tunnels.values():
             pid = self._find_autossh_pid(tunnel)
             process_ok = pid is not None
-            port_ok = self._check_tunnel_port(tunnel)
-            
-            # 基础健康状态
-            is_healthy = process_ok and port_ok
-            
-            # 检查是否在宽限期内
+            port_result = self._check_tunnel_port(tunnel)  # True/False/None
+
+            # 进程不存在 → 一定不健康
+            if not process_ok:
+                is_healthy = False
+                tunnel.fail_count += 1
+            elif port_result is None:
+                # 端口检查超时/未知 → 进程还在，不算失败，保持当前状态
+                is_healthy = True
+                # 不重置 fail_count，也不增加，让它自然衰减
+            elif port_result:
+                # 进程在 + 端口正常
+                is_healthy = True
+                tunnel.fail_count = 0
+            else:
+                # 进程在但端口确认不通
+                is_healthy = False
+                tunnel.fail_count += 1
+
+            # Grace period: 刚启动的隧道给宽限
             if tunnel.start_time is not None:
                 elapsed = time.time() - tunnel.start_time
-                in_grace_period = elapsed < grace_period
-                
-                # 宽限期内：进程存在但端口未就绪时，暂不判定为异常
-                if not is_healthy and in_grace_period and process_ok and not port_ok:
-                    self.logger.debug(
-                        f"隧道 {tunnel.name} 在宽限期内 "
-                        f"(已启动 {elapsed:.1f}s)，暂不判定为异常"
-                    )
+                if not is_healthy and elapsed < grace_period and process_ok:
                     is_healthy = True
-            
-            status[tunnel.name] = is_healthy
-            
-            if not is_healthy:
+                    tunnel.fail_count = 0
+
+            # 连续失败次数不够，暂不触发重启
+            if not is_healthy and tunnel.fail_count < max_fail_count:
+                srv = self._get_server(tunnel)
                 self.logger.warning(
-                    f"隧道 {tunnel.name} 异常: "
-                    f"进程={'✓' if process_ok else '✗'}, "
-                    f"连接={'✓' if port_ok else '✗'}"
+                    f"隧道 {tunnel.name}@{srv.name} 检查异常 ({tunnel.fail_count}/{max_fail_count}): "
+                    f"进程={'✓' if process_ok else '✗'}, 连接={self._port_status_str(port_result)}"
                 )
-        
+                is_healthy = True  # 还没达到阈值，暂不重启
+
+            if not is_healthy:
+                srv = self._get_server(tunnel)
+                self.logger.warning(
+                    f"隧道 {tunnel.name}@{srv.name} 连续 {tunnel.fail_count} 次异常，需要重启: "
+                    f"进程={'✓' if process_ok else '✗'}, 连接={self._port_status_str(port_result)}"
+                )
+
+            status[tunnel.name] = is_healthy
+
         return status
 
+    @staticmethod
+    def _port_status_str(port_result: Optional[bool]) -> str:
+        if port_result is True:
+            return '✓'
+        elif port_result is False:
+            return '✗'
+        else:
+            return '?超时'
+
     def run_daemon(self):
-        """守护进程主循环"""
         self.logger.info("=" * 60)
         self.logger.info("隧道管理器启动 (守护模式)")
+        self.logger.info(f"  服务器: {', '.join(self.servers.keys())}")
+        self.logger.info(f"  隧道数: {len(self.tunnels)}")
         self.logger.info("=" * 60)
         self.running = True
-        
+
         def signal_handler(signum, frame):
             if not self.running:
-                # 已经在退出过程中，直接返回避免重复处理
                 return
-            self.logger.info("收到停止信号，正在清理进程...")
+            self.logger.info("收到停止信号，正在清理...")
             self.running = False
-            # 立即清理所有隧道进程
             self.stop_all()
             self.logger.info("隧道管理器已停止")
             sys.exit(0)
-        
+
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
         self.start_all()
 
-        check_interval = self.settings.get('check_interval', 30)
-        self.logger.info(f"健康检查间隔: {check_interval} 秒")
-        self.logger.info("按 Ctrl+C 退出")
+        check_interval = int(self.global_settings.get("check_interval", 30))
+        self.logger.info(f"健康检查间隔: {check_interval}s | Ctrl+C 退出")
 
-        # 主循环：使用小间隔循环，以便快速响应退出信号
         while self.running:
             for _ in range(check_interval):
                 if not self.running:
                     break
                 time.sleep(1)
-            
+
             if not self.running:
                 break
-            
+
             status = self.check_health()
-            
             for name, is_healthy in status.items():
                 if not is_healthy:
                     self.logger.warning(f"重启隧道 {name}...")
                     tunnel = self.tunnels[name]
                     self.stop_tunnel(tunnel)
-                    time.sleep(2)
+                    time.sleep(5)  # 多等几秒让远程端口释放
                     self.start_tunnel(tunnel)
+                    tunnel.fail_count = 0
 
         self.stop_all()
         self.logger.info("隧道管理器已停止")
 
+    # =========================================================================
+    # Status display
+    # =========================================================================
+
     def show_status(self):
-        """显示隧道状态"""
-        print("\n" + "=" * 100)
-        print("SSH 隧道状态")
-        print("=" * 100)
-        print(f"{'名称':<25} {'类型':<10} {'端口':<25} {'进程':<14} {'状态'}")
-        print("-" * 100)
-        
         status = self.check_health()
-        for name, tunnel in self.tunnels.items():
+
+        current_server = None
+        sorted_tunnels = sorted(self.tunnels.values(), key=lambda t: (t.server_name, t.name))
+
+        print()
+        print("=" * 110)
+        print("SSH 隧道状态")
+        print("=" * 110)
+
+        for tunnel in sorted_tunnels:
+            srv = self._get_server(tunnel)
+            if current_server != tunnel.server_name:
+                current_server = tunnel.server_name
+                print(f"\n  [{srv.name}] {srv.ssh_user}@{srv.ssh_server}:{srv.ssh_port}")
+                print(f"  {'─' * 104}")
+                print(f"  {'名称':<28} {'类型':<8} {'端口映射':<35} {'进程':<14} {'状态'}")
+                print(f"  {'─' * 104}")
+
             pid = self._find_autossh_pid(tunnel)
-            process_status = f"运行({pid})" if pid else "未运行"
-            is_healthy = status.get(name, False)
-            health_status = "✅ 正常" if is_healthy else "❌ 异常"
-            
-            if tunnel.tunnel_type == 'remote':
-                port_info = f"远程:{tunnel.local_port} ← {tunnel.remote_host}:{tunnel.remote_port}"
+            process_str = f"运行({pid})" if pid else "未运行"
+            is_healthy = status.get(tunnel.name, False)
+            health_str = "✅ 正常" if is_healthy else "❌ 异常"
+
+            if tunnel.tunnel_type == "remote":
+                port_info = f"远程:{tunnel.local_port} ← 本地:{tunnel.remote_host}:{tunnel.remote_port}"
             else:
-                port_info = f"本地:{tunnel.bind_address}:{tunnel.bind_port} → {tunnel.remote_host}:{tunnel.remote_port}"
-            
-            type_label = "远程(-R)" if tunnel.tunnel_type == 'remote' else "本地(-L)"
-            print(f"{name:<25} {type_label:<10} {port_info:<25} {process_status:<14} {health_status}")
-        
-        print("=" * 100)
+                port_info = (
+                    f"本地:{tunnel.bind_address}:{tunnel.bind_port} → 远程:{tunnel.remote_host}:{tunnel.remote_port}"
+                )
+
+            type_label = "-R" if tunnel.tunnel_type == "remote" else "-L"
+            print(f"  {tunnel.name:<28} {type_label:<8} {port_info:<35} {process_str:<14} {health_str}")
+
+        print()
+        print("=" * 110)
+        total = len(self.tunnels)
+        healthy = sum(1 for v in status.values() if v)
+        print(f"  合计: {total} 隧道, {healthy} 正常, {total - healthy} 异常 | 服务器: {len(self.servers)}")
+        print("=" * 110)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='SSH Tunnel Manager')
-    parser.add_argument('--config', '-c', 
-                        default=str(Path(__file__).parent / 'tunnels.yaml'),
-                        help='配置文件路径')
-    parser.add_argument('--daemon', '-d', action='store_true',
-                        help='后台守护进程模式运行')
-    parser.add_argument('--foreground', '-f', action='store_true',
-                        help='前台运行（调试模式）')
-    parser.add_argument('--status', '-s', action='store_true',
-                        help='显示隧道状态')
-    parser.add_argument('--start', action='store_true',
-                        help='启动所有隧道')
-    parser.add_argument('--stop', action='store_true',
-                        help='停止所有隧道')
-    parser.add_argument('--restart', '-r', action='store_true',
-                        help='重启所有隧道')
-    
+    parser = argparse.ArgumentParser(
+        description="SSH Tunnel Manager (多服务器支持)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  %(prog)s --status                          # 所有隧道状态
+  %(prog)s --status --server devops          # 只看 devops
+  %(prog)s --restart                         # 重启所有
+  %(prog)s --restart --server devops         # 只重启 devops
+  %(prog)s --config tunnels.yaml devops.yaml # 加载多个配置
+  %(prog)s --foreground                      # 前台守护
+  %(prog)s --stop --server yizhao            # 只停 yizhao
+        """,
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        nargs="+",
+        default=[str(Path(__file__).parent / "tunnels.yaml")],
+        help="配置文件路径（可指定多个）",
+    )
+    parser.add_argument("--server", "-S", default=None, help="只操作指定服务器的隧道")
+    parser.add_argument("--daemon", "-d", action="store_true", help="后台守护进程")
+    parser.add_argument("--foreground", "-f", action="store_true", help="前台守护（调试）")
+    parser.add_argument("--status", "-s", action="store_true", help="显示状态")
+    parser.add_argument("--start", action="store_true", help="启动")
+    parser.add_argument("--stop", action="store_true", help="停止")
+    parser.add_argument("--restart", "-r", action="store_true", help="重启")
+
     args = parser.parse_args()
-    
-    manager = TunnelManager(args.config)
-    
+
+    manager = TunnelManager(args.config, server_filter=args.server)
+
     if args.status:
         manager.show_status()
     elif args.start:
@@ -544,5 +650,5 @@ def main():
         parser.print_help()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

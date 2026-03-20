@@ -13,6 +13,17 @@ tunnels:
     remote_port: 8888
     description: 本地代理隧道 (localhost)
 
+  # ─────────────────────────────────────────────────────────────
+  # Matrix服务器反向隧道 (Remote Forward -R)
+  # 将本地Matrix服务暴露到VPS的18300端口
+  # ─────────────────────────────────────────────────────────────
+  - name: matrix-codeforge
+    type: remote
+    local_port: 18443
+    remote_host: 127.0.0.1
+    remote_port: 18300
+    description: CodeForge Matrix Homeserver (matrix.yizhaotech.ai)
+
 # ─────────────────────────────────────────────────────────────
 # 全局设置
 # ─────────────────────────────────────────────────────────────
@@ -28,7 +39,7 @@ settings:
 
   # 绑定地址 - 用于指定 SSH 客户端从哪个 IP 出站（留空则使用默认路由）
   # 例如: 10.8.0.5 (VPN 分配的 IP)，这样 SSH 流量会走 VPN 通道
-  bind_address: "192.168.100.17"
+  # bind_address: "192.168.1.106"
 
   # autossh 检测配置
   autossh_poll: 60
