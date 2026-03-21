@@ -43,24 +43,56 @@ PF_WATCHER_PID_FILE="$HOME/proxy-tools/pf-watcher.pid"
 PF_WATCHER_INTERVAL=30  # 每 30 秒检查一次
 
 PF_MERGED="/tmp/pf-merged-chisel.conf"
+VPN_INTERFACE="utun6"
+
+_build_merged_pf() {
+  # pf 规则必须按顺序: options, scrub, nat/rdr (translation), filter
+  # 系统 pf.conf 中 rdr-anchor 在前，anchor (filter) 在后
+  # 插入自定义 rdr 在系统 rdr 之后、filter anchor 之前；pass 追加到末尾
+  {
+    # 1. 系统规则中 filter anchor 之前的部分（scrub + nat/rdr anchors）
+    awk '/^anchor /{found=1} !found{print}' /etc/pf.conf
+
+    # 2. 插入自定义 rdr 规则
+    echo ""
+    echo "# --- chisel RustDesk rdr rules ---"
+    echo "rdr pass on $VPN_INTERFACE proto tcp from any to $SERVER_IP port 21115 -> 127.0.0.1 port 21115"
+    echo "rdr pass on $VPN_INTERFACE proto tcp from any to $SERVER_IP port 21116 -> 127.0.0.1 port 21116"
+    echo "rdr pass on $VPN_INTERFACE proto tcp from any to $SERVER_IP port 21117 -> 127.0.0.1 port 21117"
+    echo "rdr pass on $VPN_INTERFACE proto tcp from any to $SERVER_IP port 21118 -> 127.0.0.1 port 21118"
+    echo "rdr pass on $VPN_INTERFACE proto tcp from any to $SERVER_IP port 21119 -> 127.0.0.1 port 21119"
+    echo "rdr pass on $VPN_INTERFACE proto udp from any to $SERVER_IP port 21115 -> 127.0.0.1 port 21115"
+    echo "rdr pass on $VPN_INTERFACE proto udp from any to $SERVER_IP port 21116 -> 127.0.0.1 port 21116"
+    echo "rdr pass on $VPN_INTERFACE proto udp from any to $SERVER_IP port 21117 -> 127.0.0.1 port 21117"
+    echo "rdr pass on $VPN_INTERFACE proto udp from any to $SERVER_IP port 21118 -> 127.0.0.1 port 21118"
+    echo "rdr pass on $VPN_INTERFACE proto udp from any to $SERVER_IP port 21119 -> 127.0.0.1 port 21119"
+    echo ""
+
+    # 3. 系统规则中 filter anchor 部分
+    awk '/^anchor /{found=1} found{print}' /etc/pf.conf
+
+    # 4. 追加自定义 pass/route-to 规则
+    echo ""
+    echo "# --- chisel RustDesk pass rules ---"
+    echo "pass out on $VPN_INTERFACE route-to lo0 proto tcp from any to $SERVER_IP port {21115, 21116, 21117, 21118, 21119}"
+    echo "pass out on $VPN_INTERFACE route-to lo0 proto udp from any to $SERVER_IP port {21115, 21116, 21117, 21118, 21119}"
+    echo "pass in quick on lo0"
+  } > "$PF_MERGED"
+}
 
 start_pf_rules() {
-  if [ ! -f "$PF_CONF" ]; then return; fi
-  # 合并系统规则 + 自定义规则，避免替换系统默认
-  cat /etc/pf.conf "$PF_CONF" > "$PF_MERGED" 2>/dev/null
+  _build_merged_pf
   sudo pfctl -ef "$PF_MERGED" 2>/dev/null
 }
 
 stop_pf_rules() {
-  # 恢复系统默认规则
   sudo pfctl -f /etc/pf.conf 2>/dev/null
   rm -f "$PF_MERGED"
 }
 
 check_pf_loaded() {
-  # 用 pfctl -sn 和 pfctl -sr 都检查，确保 rdr 和 pass 规则都在
-  sudo pfctl -sn 2>/dev/null | grep -q "172.22.164.60" && return 0
-  sudo pfctl -sr 2>/dev/null | grep -q "172.22.164.60" && return 0
+  sudo pfctl -sn 2>/dev/null | grep -q "$SERVER_IP" && return 0
+  sudo pfctl -sr 2>/dev/null | grep -q "$SERVER_IP" && return 0
   return 1
 }
 
