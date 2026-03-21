@@ -1,0 +1,37 @@
+# SSH 隧道配置 — CodeForge ↔ DevOps Server (172.22.164.60)
+# 用途: 将本地 CodeForge 端口反向映射到 60 服务器
+#       让 60 上的 ZenTao/Redmine/GitLab webhook 通过 localhost 访问 CodeForge
+
+tunnels:
+  # CodeForge API — webhook 接收端点
+  - name: codeforge-api
+    type: remote
+    local_port: 18440
+    remote_host: 127.0.0.1
+    remote_port: 18440
+    description: CodeForge API (webhook receiver)
+
+  # CodeForge WebSocket
+  - name: codeforge-ws
+    type: remote
+    local_port: 18441
+    remote_host: 127.0.0.1
+    remote_port: 18441
+    description: CodeForge WebSocket
+
+  # CodeForge Dashboard
+  - name: codeforge-dashboard
+    type: remote
+    local_port: 18443
+    remote_host: 127.0.0.1
+    remote_port: 18443
+    description: CodeForge Dashboard
+
+settings:
+  check_interval: 30
+  ssh_server: 172.22.164.60
+  ssh_port: 22
+  ssh_user: zhangtony
+  ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
+  autossh_poll: 30
+  autossh_gatetime: 0
