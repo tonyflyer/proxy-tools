@@ -9,7 +9,7 @@ servers:
     ssh_port: 27959
     ssh_user: zt
     ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
-    bind_address: "192.168.100.17"
+    vpn_interface: utun4
     autossh_poll: 10
 
   # ─── DevOps 环境 (Mac Studio 02) ──────────────────────────────
