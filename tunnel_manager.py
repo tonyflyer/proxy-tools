@@ -20,7 +20,7 @@ SSH Tunnel Manager - 管理多服务器 SSH 反向隧道和本地转发
         ssh_port: 27959
         ssh_user: zt
         ssh_key: ~/.ssh/id_ed25519_m4_to_yizhao
-        bind_address: "192.168.100.17"
+        vpn_interface: utun4
         autossh_poll: 10
       devops:
         ssh_server: 172.22.164.60
@@ -53,7 +53,9 @@ SSH Tunnel Manager - 管理多服务器 SSH 反向隧道和本地转发
 import argparse
 import logging
 import os
+import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -72,6 +74,7 @@ class ServerConfig:
     ssh_user: str = ""
     ssh_key: str = "~/.ssh/id_ed25519"
     bind_address: str = ""
+    vpn_interface: str = ""  # auto-detect if empty, e.g. "utun4"
     autossh_poll: int = 30
 
     def resolved_key(self) -> str:
@@ -156,6 +159,7 @@ class TunnelManager:
                     ssh_user=srv_data.get("ssh_user", ""),
                     ssh_key=srv_data.get("ssh_key", "~/.ssh/id_ed25519"),
                     bind_address=srv_data.get("bind_address", ""),
+                    vpn_interface=srv_data.get("vpn_interface", ""),
                     autossh_poll=int(srv_data.get("autossh_poll", settings.get("autossh_poll", 30))),
                 )
         else:
@@ -168,6 +172,7 @@ class TunnelManager:
                     ssh_user=settings.get("ssh_user", ""),
                     ssh_key=settings.get("ssh_key", "~/.ssh/id_ed25519"),
                     bind_address=settings.get("bind_address", ""),
+                    vpn_interface=settings.get("vpn_interface", ""),
                     autossh_poll=int(settings.get("autossh_poll", 30)),
                 )
 
@@ -206,6 +211,66 @@ class TunnelManager:
             self.logger.error(f"  可用服务器: {list(self.servers.keys())}")
             sys.exit(1)
         return srv
+
+    # =========================================================================
+    # VPN route management
+    # =========================================================================
+
+    def _detect_vpn_interface(self) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                ["ifconfig"], capture_output=True, text=True, timeout=5
+            )
+            for block in result.stdout.split("\n\n"):
+                m = re.match(r"(\S+):", block)
+                if m:
+                    iface = m.group(1)
+                    if iface.startswith("utun") and re.search(r"inet\s+[\d.]+", block):
+                        return iface
+        except Exception:
+            pass
+        return None
+
+    def _check_reachability(self, host: str, port: int, timeout: float = 3.0) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect((host, port))
+            return True
+        except Exception:
+            return False
+        finally:
+            sock.close()
+
+    def _ensure_vpn_route(self, srv: ServerConfig) -> bool:
+        if not self._check_reachability(srv.ssh_server, srv.ssh_port):
+            vpn_iface = srv.vpn_interface
+            if not vpn_iface:
+                vpn_iface = self._detect_vpn_interface()
+
+            if not vpn_iface:
+                self.logger.warning(
+                    f"服务器 {srv.name} ({srv.ssh_server}) 不可达，且未检测到 VPN 接口，跳过路由设置"
+                )
+                return False
+
+            self.logger.info(f"检测到 VPN 接口 {vpn_iface}，尝试添加路由: {srv.ssh_server} → {vpn_iface}")
+            try:
+                subprocess.run(
+                    ["route", "-n", "add", srv.ssh_server, "-interface", vpn_iface],
+                    capture_output=True, text=True, timeout=5
+                )
+                time.sleep(1)
+                if self._check_reachability(srv.ssh_server, srv.ssh_port, timeout=5):
+                    self.logger.info(f"路由添加成功，{srv.ssh_server} 现已可达")
+                    return True
+                else:
+                    self.logger.warning(f"路由添加完成但 {srv.ssh_server} 仍不可达")
+                    return False
+            except Exception as e:
+                self.logger.error(f"添加 VPN 路由失败: {e}")
+                return False
+        return True
 
     # =========================================================================
     # autossh command building
@@ -362,6 +427,9 @@ class TunnelManager:
     # =========================================================================
 
     def start_tunnel(self, tunnel: Tunnel) -> bool:
+        srv = self._get_server(tunnel)
+        self._ensure_vpn_route(srv)
+
         self._cleanup_tunnel_process(tunnel)
         time.sleep(1)
 
